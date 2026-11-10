@@ -323,20 +323,34 @@ vec4 getAirColor(vec2 fragCoordIn)
 
   // Sub-grid flow-advected edge detail (cauliflower lobes for warm cumulus, silky streaks for high ice cirrus/anvils)
   float microFbm = 0.5;
-  if (rawCloud > 0.001 || water[PRECIPITATION] > 0.002) {
+  float cL = 0.0, cR = 0.0, cD = 0.0, cU = 0.0;
+  bool haveLocalNeighbors = false;
+
+  if (rawCloud > 0.0005 || water[PRECIPITATION] > 0.002 || wall[DISTANCE] >= 2) {
+    cL = sampleCloudSafe(bndFragCoord - vec2(1.25, 0.0));
+    cR = sampleCloudSafe(bndFragCoord + vec2(1.25, 0.0));
+    cD = sampleCloudSafe(bndFragCoord - vec2(0.0, 1.25));
+    cU = sampleCloudSafe(bndFragCoord + vec2(0.0, 1.25));
+    haveLocalNeighbors = true;
+  }
+
+  if (rawCloud > 0.0005 || cL + cR + cD + cU > 0.004 || water[PRECIPITATION] > 0.002) {
     float localCurl = texture(curlTex, bndFragCoord * texelSize).r;
     microFbm = sampleFlowCloudDetail(bndFragCoord, base.xy, localCurl, iceFrac);
 
-    if (rawCloud > 0.001) {
-      // Gently sculpt thin-to-moderate cloud margins while keeping dense cloud cores faithful to the fluid solver
-      float edgeMask = exp(-rawCloud * 1.35) * smoothstep(0.001, 0.04, rawCloud);
-      float erodeStrength = mix(0.26, 0.38, iceFrac);
-      cloudwater = max(rawCloud + (microFbm - 0.48) * erodeStrength * edgeMask, 0.0);
+    if (rawCloud > 0.0002 || cL + cR + cD + cU > 0.006) {
+      // Gradient-normalized sculpting (~1.1-cell physical cauliflower turret relief at ANY liquid/ice water content!)
+      // Preserves flat horizontal Lifting Condensation Level (LCL) cloud bases while sculpting tops & flanks into crisp florets
+      float gradMag = length(vec2(cR - cL, cU - cD)) * 0.45;
+      float upwardGrad = max(cU - cD, 0.0);
+      float baseFlatPreserve = 1.0 - 0.68 * smoothstep(0.02, 0.25, upwardGrad / (gradMag + 0.02)) * (1.0 - iceFrac);
+      float carveAmp = gradMag * mix(1.05, 1.45, iceFrac) * baseFlatPreserve + 0.035 * smoothstep(0.0005, 0.04, rawCloud) * exp(-rawCloud * 1.4);
+      cloudwater = max(rawCloud + (microFbm - 0.47) * carveAmp, 0.0);
     }
   }
 
-  // Beer-Lambert optical opacity: warm liquid droplets are crisp & dense; high ice cirrus/anvils are gossamer & translucent
-  float cloudExt = cloudwater * mix(10.5, 6.0, iceFrac);
+  // Beer-Lambert optical opacity: warm liquid droplets have crisp cauliflower silhouettes; ice cirrus/anvils are silky & gossamer
+  float cloudExt = cloudwater * mix(11.5, 6.2, iceFrac);
   float cloudOpacity = 1.0 - exp(-cloudExt);
 
   // Wind-sheared precipitation curtains (slanted rain / virga shafts above 0 C, soft drifting snow trails below 0 C)
@@ -356,63 +370,109 @@ vec4 getAirColor(vec2 fragCoordIn)
 
   float hydrometeorOpacity = 1.0 - (1.0 - cloudOpacity) * (1.0 - precipOpacity);
 
-  // 3D Volumetric-Style Cloud & Precipitation Lighting
+  // 3D Multi-Scattering Volumetric Cloud & Precipitation Lighting
   float scatering = clamp(map_range(abs(sunAngle), 68. * deg2rad, 90. * deg2rad, 0., 1.), 0., 1.);
   vec3 directSunCol = sunColor(scatering);
   float sunElev = cos(sunAngle);
   float daylight = smoothstep(-0.06, 0.18, sunElev);
   float twilight = smoothstep(-0.08, 0.05, sunElev) * (1.0 - smoothstep(0.06, 0.34, sunElev));
 
-  vec3 cloudNormal = vec3(0.0, 0.25, 0.968);
+  vec3 cloudNormal = vec3(0.0, 0.22, 0.975);
   float stormCoreDarkening = 1.0;
+  float creviceAO = 1.0;
+  float skyOcclusion = 1.0;
 
-  if (rawCloud > 0.002 && wall[DISTANCE] >= 2) {
-    // Multi-scale optical gradient reconstructs 3D outward-bulging cauliflower domes & crevices
+  if ((cloudwater > 0.001 || rawCloud > 0.001) && wall[DISTANCE] >= 2) {
+    // Multi-scale optical gradient + Difference-of-Gaussians lobe convexity reconstructs true 3D cauliflower domes & dark crevices!
     float wallGradMask = smoothstep(1.5, 4.5, float(wall[DISTANCE]));
-    float cL = sampleCloudSafe(bndFragCoord - vec2(1.35, 0.0));
-    float cR = sampleCloudSafe(bndFragCoord + vec2(1.35, 0.0));
-    float cD = sampleCloudSafe(bndFragCoord - vec2(0.0, 1.35));
-    float cU = sampleCloudSafe(bndFragCoord + vec2(0.0, 1.35));
-
-    vec2 fineGrad = vec2(cR - cL, cU - cD) * 0.37;
+    if (!haveLocalNeighbors) {
+      cL = sampleCloudSafe(bndFragCoord - vec2(1.25, 0.0));
+      cR = sampleCloudSafe(bndFragCoord + vec2(1.25, 0.0));
+      cD = sampleCloudSafe(bndFragCoord - vec2(0.0, 1.25));
+      cU = sampleCloudSafe(bndFragCoord + vec2(0.0, 1.25));
+    }
+    float fineAvg = 0.25 * (cL + cR + cD + cU);
+    vec2 fineGrad = vec2(cR - cL, cU - cD) * 0.40;
 
     vec2 macroGrad = fineGrad;
+    float macroAvg = fineAvg;
     if (wall[DISTANCE] >= 6) {
-      float mL = sampleCloudSafe(bndFragCoord - vec2(4.2, 0.0));
-      float mR = sampleCloudSafe(bndFragCoord + vec2(4.2, 0.0));
-      float mD = sampleCloudSafe(bndFragCoord - vec2(0.0, 4.2));
-      float mU = sampleCloudSafe(bndFragCoord + vec2(0.0, 4.2));
-      macroGrad = vec2(mR - mL, mU - mD) * 0.12;
+      float mL = sampleCloudSafe(bndFragCoord - vec2(4.5, 0.0));
+      float mR = sampleCloudSafe(bndFragCoord + vec2(4.5, 0.0));
+      float mD = sampleCloudSafe(bndFragCoord - vec2(0.0, 4.5));
+      float mU = sampleCloudSafe(bndFragCoord + vec2(0.0, 4.5));
+      macroAvg = 0.25 * (mL + mR + mD + mU);
+      macroGrad = vec2(mR - mL, mU - mD) * 0.14;
     }
 
-    // Subtle micro-normal perturbation on sunlit cumulus turrets
-    vec2 microGrad = vec2(microFbm - 0.5) * 0.06 * exp(-rawCloud * 0.8);
-    vec2 combinedGrad = (fineGrad * 0.65 + macroGrad * 0.55 + microGrad) * wallGradMask;
+    // Sub-grid normal bump from flow-advected billow FBM for crisp close-up floret relief
+    float bumpDx = cumulusBillowFbm(bndFragCoord * 0.28 + vec2(0.45, 0.0)) - cumulusBillowFbm(bndFragCoord * 0.28 - vec2(0.45, 0.0));
+    float bumpDy = cumulusBillowFbm(bndFragCoord * 0.28 + vec2(0.0, 0.45)) - cumulusBillowFbm(bndFragCoord * 0.28 - vec2(0.0, 0.45));
+    vec2 microGrad = vec2(bumpDx, bumpDy) * mix(0.085, 0.025, iceFrac) * smoothstep(0.002, 0.08, cloudwater);
+
+    vec2 combinedGrad = (fineGrad * 0.72 + macroGrad * 0.62 + microGrad) * wallGradMask;
 
     // Outward 3D normal points opposite to inward density gradient (-d(q)/dx, -d(q)/dy, +z_bulge)
-    float zBulge = 0.26 + 0.18 * clamp(rawCloud, 0.0, 2.0);
+    float zBulge = 0.14 + 0.07 * clamp(rawCloud, 0.0, 2.0);
     cloudNormal = normalize(vec3(-combinedGrad.x, -combinedGrad.y, zBulge));
 
-    // Deep storm cores absorb & trap multi-scattered photons, creating dramatic dark cumulonimbus bases
-    stormCoreDarkening = 1.0 / (1.0 + max(rawCloud - 0.65, 0.0) * 0.095 + precipAmount * 0.085);
+    // Difference-of-Gaussians convexity: outward cauliflower lobes (> 0) catch extra sky light; inward folds (< 0) get deep crevice AO!
+    float lobeConvexity = (rawCloud - macroAvg) / (macroAvg + 0.12) + (microFbm - 0.48) * 0.55;
+    creviceAO = clamp(0.76 + 0.34 * lobeConvexity, 0.44, 1.16);
+
+    // Overhead vertical cloud column depth (separates bright tops from dark brooding cumulonimbus undersides)
+    float overheadCol = (
+      sampleCloudSafe(bndFragCoord + vec2(0.0, 3.0)) * 0.8 +
+      sampleCloudSafe(bndFragCoord + vec2(0.0, 8.0)) * 1.3 +
+      sampleCloudSafe(bndFragCoord + vec2(0.0, 16.0)) * 2.0 +
+      sampleCloudSafe(bndFragCoord + vec2(0.0, 28.0)) * 2.6
+    );
+    skyOcclusion = exp(-overheadCol * 0.085);
+    stormCoreDarkening = clamp(exp(-overheadCol * 0.032 - precipAmount * 0.065), 0.34, 1.0);
   }
 
-  // Sun direction in 3D (with slight forward camera-side elevation so midday clouds retain rich 3D lobe sculpting)
-  vec3 sunDir3D = normalize(vec3(sin(sunAngle), max(sunElev, -0.15), 0.38));
+  // Sun direction in 3D (with forward camera-side angle so midday cumulus towers still show dramatic 3D lobe sculpting)
+  vec3 sunDir3D = normalize(vec3(sin(sunAngle), max(sunElev, -0.15), 0.44));
   float NdotL = dot(cloudNormal, sunDir3D);
 
-  // Sample upwind sunlight 2.2 cells toward the sun for thin-edge forward Mie scattering ("silver lining")
-  vec2 sunStep2D = vec2(sin(sunAngle), max(sunElev, 0.05)) * 2.2;
-  vec2 upwindPos = vec2(bndFragCoord.x + sunStep2D.x, min(bndFragCoord.y + sunStep2D.y, resolution.y - 0.5));
+  // Local 6-step Volumetric Solar Raymarch + Wrenninge 3-Octave Multiple Scattering!
+  // Replaces flat exponentially-crushed single-scattering with luminous deep multi-scattered cumulus turrets & crisp self-shadows
+  vec2 sunRayDir2D = normalize(vec2(sin(sunAngle), max(sunElev, 0.06)));
+  float tauLocal = 0.0;
+  if (cloudOpacity > 0.003 && daylight > 0.01) {
+    tauLocal += sampleCloudSafe(bndFragCoord + sunRayDir2D * 1.1) * 1.1;
+    tauLocal += sampleCloudSafe(bndFragCoord + sunRayDir2D * 2.5) * 1.5;
+    tauLocal += sampleCloudSafe(bndFragCoord + sunRayDir2D * 4.5) * 2.2;
+    tauLocal += sampleCloudSafe(bndFragCoord + sunRayDir2D * 7.5) * 3.2;
+    tauLocal += sampleCloudSafe(bndFragCoord + sunRayDir2D * 11.5) * 4.4;
+    tauLocal += sampleCloudSafe(bndFragCoord + sunRayDir2D * 16.5) * 5.6;
+  }
+
+  // Macro irradiance entering above the local 18-cell raymarch window (accounts for distant upper cloud decks / terrain shadows)
+  vec2 macroLightProbe = vec2(bndFragCoord.x + sunRayDir2D.x * 18.0, min(bndFragCoord.y + sunRayDir2D.y * 18.0, resolution.y - 0.5));
+  float macroSunLight = max(bilerp(lightTex, macroLightProbe)[0] / standardSunBrightness, lightIntensity);
+
+  // 3-octave multiple-scattering transmittance (Wrenninge / Frostbite / Horizon Zero Dawn volumetric cloud model)
+  float extCoeff = mix(0.28, 0.16, iceFrac);
+  float tauSun = tauLocal * extCoeff;
+  float multiScatter = (
+    0.56 * exp(-tauSun) +
+    0.30 * exp(-tauSun * 0.28) +
+    0.14 * exp(-tauSun * 0.08)
+  );
+  float effectiveDirectLight = mix(lightIntensity, macroSunLight * multiScatter, smoothstep(0.01, 0.15, cloudOpacity));
+
+  // Sample upwind sunlight 2.4 cells toward the sun for thin-edge forward Mie scattering ("silver lining")
+  vec2 upwindPos = vec2(bndFragCoord.x + sunRayDir2D.x * 2.4, min(bndFragCoord.y + sunRayDir2D.y * 2.4, resolution.y - 0.5));
   float upwindLight = bilerp(lightTex, upwindPos)[0] / standardSunBrightness;
 
-  // 3D lobe relief + Schneider-Vos Beer-Powder multi-scattering + Henyey-Greenstein silver lining
-  float reliefFactor = mix(0.64, 1.24, smoothstep(-0.60, 0.78, NdotL));
-  float beerPowder = mix(1.0, 1.0 - 0.36 * exp(-cloudwater * 3.4), clamp(cloudOpacity, 0.0, 1.0));
-  float rimPeak = exp(-cloudwater * 1.9) * (1.0 - exp(-cloudwater * 9.0));
-  float silverLining = rimPeak * max(upwindLight, lightIntensity) * mix(0.48, 0.82, twilight);
+  // 3D lobe relief + Schneider-Vos Beer-Powder dark-edge rim + Henyey-Greenstein silver lining
+  float reliefFactor = mix(0.46, 1.34, smoothstep(-0.65, 0.80, NdotL));
+  float beerPowder = mix(1.0, 1.0 - 0.42 * exp(-cloudwater * 3.8), clamp(cloudOpacity, 0.0, 1.0));
+  float rimPeak = exp(-cloudwater * 2.1) * (1.0 - exp(-cloudwater * 10.0));
+  float silverLining = rimPeak * max(upwindLight, effectiveDirectLight) * mix(0.55, 0.92, twilight);
 
-  vec3 directTerm = directSunCol * (lightIntensity * reliefFactor * beerPowder + silverLining);
+  vec3 directTerm = directSunCol * (effectiveDirectLight * reliefFactor * beerPowder * creviceAO + silverLining);
 
   // Physically colored hemispheric sky-dome + earth-bounce ambient shading (replaces colorless gray shadows!)
   vec3 daySkyTint = vec3(0.56, 0.73, 1.00);
