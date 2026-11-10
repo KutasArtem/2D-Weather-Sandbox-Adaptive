@@ -7212,6 +7212,9 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     } else {
       const infoLog = gl.getProgramInfoLog(program);
       gl.deleteProgram(program);
+      if (loadingBar) {
+        loadingBar.showError('ERROR linking WebGL program: ' + infoLog);
+      }
       throw new Error('ERROR linking program: ' + infoLog);
     }
   }
@@ -7276,9 +7279,12 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
       const log = gl.getShaderInfoLog(shader);
       gl.deleteShader(shader);
+      if (loadingBar) {
+        await loadingBar.showError(filename + ' COMPILATION ERROR: ' + log);
+      }
       throw new Error(filename + ' COMPILATION ' + log);
     }
-    await loadingBar.add(3, 'Loading shader: ' + nameIn);
+    await loadingBar.add(2.5, 'Loading shader: ' + nameIn);
     return shader;
   }
 
